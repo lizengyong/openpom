@@ -247,32 +247,118 @@ class MPNNPOM(nn.Module):
         g.ndata['node_emb'] = node_encodings
         g.edata['edge_emb'] = self.project_edge_feats(edge_feats)
 
-        def message_func(edges) -> Dict:
-            """
-            The message function to generate messages
-            along the edges for DGLGraph.send_and_recv()
-            """
-            src_msg: torch.Tensor = torch.cat(
-                (edges.src['node_emb'], edges.data['edge_emb']), dim=1)
-            return {'src_msg': src_msg}
+        is_npu_sr = node_encodings.device.type == 'npu'
+        src, dst = g.edges()
+        if len(src) > 0:
+            if is_npu_sr:
+                node_emb = g.ndata['node_emb']
+                edge_emb = g.edata['edge_emb']
+                msg = torch.cat([node_emb[src], edge_emb], dim=1)
+                src_msg = torch.zeros(
+                    g.num_nodes(), msg.shape[1], device=msg.device)
+                src_msg.scatter_add_(
+                    0, dst.unsqueeze(-1).expand(-1, msg.shape[1]), msg)
+                g.ndata['src_msg_sum'] = src_msg
+            else:
+                def message_func(edges) -> Dict:
+                    src_msg: torch.Tensor = torch.cat(
+                        (edges.src['node_emb'], edges.data['edge_emb']), dim=1)
+                    return {'src_msg': src_msg}
 
-        def reduce_func(nodes) -> Dict:
-            """
-            The reduce function to aggregate the messages
-            for DGLGraph.send_and_recv()
-            """
-            src_msg_sum: torch.Tensor = torch.sum(nodes.mailbox['src_msg'],
-                                                  dim=1)
-            return {'src_msg_sum': src_msg_sum}
+                def reduce_func(nodes) -> Dict:
+                    src_msg_sum: torch.Tensor = torch.sum(
+                        nodes.mailbox['src_msg'], dim=1)
+                    return {'src_msg_sum': src_msg_sum}
 
-        # radius 0 combination to fold atom and bond embeddings together
-        g.send_and_recv(g.edges(),
-                        message_func=message_func,
-                        reduce_func=reduce_func)
+                g.send_and_recv(g.edges(),
+                                message_func=message_func,
+                                reduce_func=reduce_func)
+        else:
+            d = node_encodings.shape[1] + self.project_edge_feats(edge_feats).shape[1]
+            g.ndata['src_msg_sum'] = torch.zeros(
+                g.num_nodes(), d, device=node_encodings.device)
 
         if self.readout_type == 'set2set':
-            batch_mol_hidden_states: torch.Tensor = self.readout_set2set(
-                g, g.ndata['src_msg_sum'])
+            src_msg = g.ndata['src_msg_sum']
+            is_npu = src_msg.device.type == 'npu'
+            if is_npu:
+                if not hasattr(self, '_s2s_npu_converted'):
+                    s2s = self.readout_set2set
+                    self._s2s_n_iters = s2s.n_iters
+                    self._s2s_n_layers = s2s.n_layers
+                    self._s2s_input_dim = s2s.input_dim
+                    self._s2s_output_dim = s2s.output_dim
+                    lstm = s2s.lstm
+                    self._s2s_lstm_w = []
+                    self._s2s_lstm_h = []
+                    self._s2s_lstm_b = []
+                    for l in range(self._s2s_n_layers):
+                        w_ih = getattr(lstm, f'weight_ih_l{l}').data.to(src_msg.device)
+                        w_hh = getattr(lstm, f'weight_hh_l{l}').data.to(src_msg.device)
+                        b_ih = getattr(lstm, f'bias_ih_l{l}').data.to(src_msg.device)
+                        b_hh = getattr(lstm, f'bias_hh_l{l}').data.to(src_msg.device)
+                        self._s2s_lstm_w.append((w_ih, w_hh))
+                        self._s2s_lstm_b.append((b_ih, b_hh))
+                    self._s2s_npu_converted = True
+
+                d = self._s2s_input_dim
+                batch_size = g.batch_size
+                num_nodes = src_msg.shape[0]
+                batch_num_nodes = g.batch_num_nodes()
+                if isinstance(batch_num_nodes, torch.Tensor):
+                    batch_num_nodes = batch_num_nodes.to(src_msg.device)
+                else:
+                    batch_num_nodes = torch.tensor(
+                        batch_num_nodes, dtype=torch.long, device=src_msg.device)
+                graph_idx = torch.arange(
+                    batch_size, device=src_msg.device
+                ).repeat_interleave(batch_num_nodes)
+
+                h = src_msg.new_zeros((self._s2s_n_layers, batch_size, d))
+                c = src_msg.new_zeros((self._s2s_n_layers, batch_size, d))
+                q_star = src_msg.new_zeros(batch_size, self._s2s_output_dim)
+
+                for _ in range(self._s2s_n_iters):
+                    x = q_star
+                    for layer in range(self._s2s_n_layers):
+                        w_ih, w_hh = self._s2s_lstm_w[layer]
+                        b_ih, b_hh = self._s2s_lstm_b[layer]
+                        gates = x @ w_ih.T + b_ih + h[layer] @ w_hh.T + b_hh
+                        i, f, g, o = gates.chunk(4, dim=1)
+                        i = torch.sigmoid(i)
+                        f = torch.sigmoid(f)
+                        g = torch.tanh(g)
+                        o = torch.sigmoid(o)
+                        c[layer] = f * c[layer] + i * g
+                        h[layer] = o * torch.tanh(c[layer])
+                        x = h[layer]
+                    q = x
+
+                    q_bc = q[graph_idx]
+                    e = (src_msg * q_bc).sum(dim=-1, keepdim=True)
+                    e_flat = e.squeeze(-1)
+
+                    max_per_graph = src_msg.new_full((batch_size,), -float('inf'))
+                    for i in range(batch_size):
+                        mask = (graph_idx == i)
+                        if mask.any():
+                            max_per_graph[i] = e_flat[mask].max()
+                    e_exp = torch.exp(e_flat - max_per_graph[graph_idx])
+                    sum_per_graph = torch.zeros(
+                        batch_size, device=src_msg.device).scatter_add(
+                        0, graph_idx, e_exp)
+                    alpha = (e_exp / sum_per_graph[graph_idx]).unsqueeze(-1)
+
+                    r = src_msg * alpha
+                    readout = torch.zeros(
+                        batch_size, d, device=src_msg.device).scatter_add(
+                        0, graph_idx.unsqueeze(-1).expand(-1, d), r)
+                    q_star = torch.cat([q, readout], dim=-1)
+
+                batch_mol_hidden_states = q_star
+            else:
+                batch_mol_hidden_states: torch.Tensor = self.readout_set2set(
+                    g, src_msg)
         elif self.readout_type == 'global_sum_pooling':
             batch_mol_hidden_states = dgl.sum_nodes(g, 'src_msg_sum')
 
@@ -599,3 +685,4 @@ class MPNNPOMModel(TorchModel):
         _, labels, weights = super(MPNNPOMModel, self)._prepare_batch(
             ([], labels, weights))
         return g, labels, weights
+
