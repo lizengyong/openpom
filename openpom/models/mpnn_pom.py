@@ -282,26 +282,8 @@ class MPNNPOM(nn.Module):
             src_msg = g.ndata['src_msg_sum']
             is_npu = src_msg.device.type == 'npu'
             if is_npu:
-                if not hasattr(self, '_s2s_npu_converted'):
-                    s2s = self.readout_set2set
-                    self._s2s_n_iters = s2s.n_iters
-                    self._s2s_n_layers = s2s.n_layers
-                    self._s2s_input_dim = s2s.input_dim
-                    self._s2s_output_dim = s2s.output_dim
-                    lstm = s2s.lstm
-                    self._s2s_lstm_w = []
-                    self._s2s_lstm_h = []
-                    self._s2s_lstm_b = []
-                    for l in range(self._s2s_n_layers):
-                        w_ih = getattr(lstm, f'weight_ih_l{l}').data.to(src_msg.device)
-                        w_hh = getattr(lstm, f'weight_hh_l{l}').data.to(src_msg.device)
-                        b_ih = getattr(lstm, f'bias_ih_l{l}').data.to(src_msg.device)
-                        b_hh = getattr(lstm, f'bias_hh_l{l}').data.to(src_msg.device)
-                        self._s2s_lstm_w.append((w_ih, w_hh))
-                        self._s2s_lstm_b.append((b_ih, b_hh))
-                    self._s2s_npu_converted = True
-
-                d = self._s2s_input_dim
+                s2s = self.readout_set2set
+                d = s2s.input_dim
                 batch_size = g.batch_size
                 num_nodes = src_msg.shape[0]
                 batch_num_nodes = g.batch_num_nodes()
@@ -314,25 +296,13 @@ class MPNNPOM(nn.Module):
                     batch_size, device=src_msg.device
                 ).repeat_interleave(batch_num_nodes)
 
-                h = src_msg.new_zeros((self._s2s_n_layers, batch_size, d))
-                c = src_msg.new_zeros((self._s2s_n_layers, batch_size, d))
-                q_star = src_msg.new_zeros(batch_size, self._s2s_output_dim)
+                h = (src_msg.new_zeros(s2s.n_layers, batch_size, d),
+                     src_msg.new_zeros(s2s.n_layers, batch_size, d))
+                q_star = src_msg.new_zeros(batch_size, s2s.output_dim)
 
-                for _ in range(self._s2s_n_iters):
-                    x = q_star
-                    for layer in range(self._s2s_n_layers):
-                        w_ih, w_hh = self._s2s_lstm_w[layer]
-                        b_ih, b_hh = self._s2s_lstm_b[layer]
-                        gates = x @ w_ih.T + b_ih + h[layer] @ w_hh.T + b_hh
-                        i, f, g, o = gates.chunk(4, dim=1)
-                        i = torch.sigmoid(i)
-                        f = torch.sigmoid(f)
-                        g = torch.tanh(g)
-                        o = torch.sigmoid(o)
-                        c[layer] = f * c[layer] + i * g
-                        h[layer] = o * torch.tanh(c[layer])
-                        x = h[layer]
-                    q = x
+                for _ in range(s2s.n_iters):
+                    q, h = s2s.lstm(q_star.unsqueeze(0), h)
+                    q = q.squeeze(0)
 
                     q_bc = q[graph_idx]
                     e = (src_msg * q_bc).sum(dim=-1, keepdim=True)
